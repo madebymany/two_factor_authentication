@@ -105,6 +105,63 @@ describe Devise::Models::TwoFactorAuthenticatable do
 
     it_behaves_like 'authenticate_totp', GuestUser.new
     it_behaves_like 'authenticate_totp', EncryptedUser.new
+
+    # Regression: ROTP >= 3 returns TOTP#verify as an Integer Unix epoch rather
+    # than a boolean. When totp_timestamp is a real datetime column (as in a
+    # consuming app) that raw Integer must be coerced to a Time before
+    # assignment, otherwise it overflows the column on Postgres under Rails 8.
+    # The GuestUser/EncryptedUser doubles above store totp_timestamp as a plain
+    # attribute, so they never exercise the datetime round-trip.
+    context 'with a datetime-backed totp_timestamp column' do
+      before(:all) do
+        ActiveRecord::Migration.suppress_messages do
+          ActiveRecord::Schema.define do
+            create_table :totp_timestamp_users, force: true do |t|
+              t.string   :otp_secret_key
+              t.integer  :second_factor_attempts_count, default: 0
+              t.datetime :totp_timestamp
+            end
+          end
+        end
+
+        unless defined?(TotpTimestampUser)
+          klass = Class.new(ActiveRecord::Base) do
+            self.table_name = 'totp_timestamp_users'
+            include Devise::Models::TwoFactorAuthenticatable
+            has_one_time_password
+          end
+          Object.const_set(:TotpTimestampUser, klass)
+        end
+      end
+
+      let(:instance) { TotpTimestampUser.create!(otp_secret_key: '2z6hxkdwi3uvrnpn') }
+      let(:otp_length) { instance.class.otp_length }
+      let(:drift) { instance.class.allowed_otp_drift_seconds }
+      let(:code) { TotpHelper.new(instance.otp_secret_key, otp_length).totp_code }
+
+      it 'coerces the verified epoch to a Time and persists it without error' do
+        # The epoch ROTP#verify returns for this code, computed independently.
+        expected_epoch = ROTP::TOTP.new(instance.otp_secret_key, digits: otp_length).
+          verify(code, drift_ahead: drift, drift_behind: drift).to_i
+
+        expect(instance.authenticate_totp(code)).to eq(true)
+        expect { instance.save! }.not_to raise_error
+
+        instance.reload
+        expect(instance.totp_timestamp.acts_like?(:time)).to be true
+        expect(instance.totp_timestamp.to_i).to eq(expected_epoch)
+      end
+
+      it 'feeds the persisted timestamp back to ROTP to prevent code reuse' do
+        expect(instance.authenticate_totp(code)).to eq(true)
+        instance.save!
+        instance.reload
+
+        # totp_timestamp is now a datetime read from the DB; ROTP must still be
+        # able to derive the same epoch from it via #to_i for replay protection.
+        expect(instance.authenticate_totp(code)).to eq(false)
+      end
+    end
   end
 
   describe '#send_two_factor_authentication_code' do
