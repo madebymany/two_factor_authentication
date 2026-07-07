@@ -44,7 +44,9 @@ module Devise
             drift_ahead: drift, drift_behind: drift, after: totp_timestamp
           )
           return false unless new_timestamp
-          self.totp_timestamp = new_timestamp
+          # ROTP >= 3 returns the verified epoch as an Integer, not a boolean.
+          # Coerce it to a Time so it can be stored in a datetime column.
+          self.totp_timestamp = Time.at(new_timestamp).utc
           true
         end
 
